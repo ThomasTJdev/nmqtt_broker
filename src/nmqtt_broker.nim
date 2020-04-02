@@ -54,7 +54,25 @@ type
     subscribe: Table[string, uint8] # Topic, Qos
 
   MqttSub* = ref object ## Managing the subscribers
+    host: string
+    port: Port
+    doSsl: bool
+    username: string
+    password: string
+    state: State
+    clientId: string
+    s: AsyncSocket
+    ssl: SslContext
+
+    msgIdSeq: MsgId
+    workQueue: Table[MsgId, Work]
+    inWork: bool
+
     subscribers: Table[string, seq[MqttCtx]]
+
+  MqttRetain* = ref object
+    messages: seq[string] # Topic, Msg, Qos
+
 
   State = enum
     Disabled, Disconnected, Connecting, Connected, Disconnecting, Error
@@ -80,7 +98,7 @@ type
     PingResp    = 13
     Disconnect  = 14
 
-  #[ConnectFlag = enum
+  ConnectFlag = enum
     WillQoS0     = 0x00
     CleanSession = 0x02
     WillFlag     = 0x04
@@ -88,7 +106,7 @@ type
     WillQoS2     = 0x10
     WillRetain   = 0x20
     PasswordFlag = 0x40
-    UserNameFlag = 0x80]#
+    UserNameFlag = 0x80
 
   ConnAckFlag = enum
     ConnAcc               = 0x00
@@ -164,26 +182,35 @@ proc wrn(ctx: MqttCtx, s: string) =
 
 var mqttsub = MqttSub()
 
-proc addSubscriber(ctx: MqttCtx, topic: string) =
+proc addSubscriber(ctx: MqttCtx, topic: string) {.async.} =
   ## Adds a subscriber to MqttSub
-  if mqttsub.subscribers.hasKey(topic):
-    mqttsub.subscribers[topic].insert(ctx)
-  else:
-    mqttsub.subscribers[topic] = @[ctx]
+  try:
+    if mqttsub.subscribers.hasKey(topic):
+      mqttsub.subscribers[topic].insert(ctx)
+    else:
+      mqttsub.subscribers[topic] = @[ctx]
+  except:
+    echo "crash add subcriber"
 
-proc removeSubscriber(ctx: MqttCtx, topic: string) =
+proc removeSubscriber(ctx: MqttCtx, topic: string) {.async.} =
   ## Removes a subscriber from specific topic
-  if mqttsub.subscribers.hasKey(topic):
-    mqttsub.subscribers[topic] = filter(mqttsub.subscribers[topic], proc(x: MqttCtx): bool = x != ctx)
+  try:
+    if mqttsub.subscribers.hasKey(topic):
+      mqttsub.subscribers[topic] = filter(mqttsub.subscribers[topic], proc(x: MqttCtx): bool = x != ctx)
+  except:
+    echo "crash in sub remove specific"
 
-proc removeSubscriber(ctx: MqttCtx) =
+proc removeSubscriber(ctx: MqttCtx) {.async.} =
   ## Removes a subscriber without knowing the topics
-  for t, c in mqttsub.subscribers:
-    if ctx in c:
-      mqttsub.subscribers[t] = filter(c, proc(x: MqttCtx): bool = x != ctx)
+  try:
+    for t, c in mqttsub.subscribers:
+      if ctx in c:
+        mqttsub.subscribers[t] = filter(c, proc(x: MqttCtx): bool = x != ctx)
 
-      if mqttsub.subscribers[t].len() == 0:
-        mqttsub.subscribers.del(t)
+        if mqttsub.subscribers[t].len() == 0:
+          mqttsub.subscribers.del(t)
+  except:
+    echo "crash remove sub"
 
 
 #
@@ -344,7 +371,7 @@ proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
   return pkt
 
 
-#[proc sendConnect(ctx: MqttCtx): Future[bool] =
+proc sendConnect(ctx: MqttCtx): Future[bool] =
   var flags: uint8
   flags = flags or CleanSession.uint8
   if ctx.username != "":
@@ -363,7 +390,7 @@ proc recv(ctx: MqttCtx): Future[Pkt] {.async.} =
     pkt.put ctx.password, true
   ctx.state = Connecting
   result = ctx.send(pkt)
-]#
+
 
 #[proc sendDisconnect(ctx: MqttCtx): Future[bool] =
   let pkt = newPkt(Disconnect, 0)
@@ -483,36 +510,40 @@ proc work(ctx: MqttCtx) {.async.} =
     return
   ctx.inWork = true
   if ctx.state == Connected:
-    var delWork: seq[MsgId]
-    for msgId, work in ctx.workQueue:
+    try:
+      var delWork: seq[MsgId]
+      for msgId, work in ctx.workQueue:
 
-      if work.typ in [ConnAck, SubAck, UnsubAck, PingResp]:
-        if await ctx.sendWork(work): delWork.add msgId
-
-      elif work.wk == PubWork and work.state == WorkNew:
-        if work.typ == Publish and work.qos == 0:
+        if work.typ in {ConnAck, SubAck, UnsubAck, PingResp}:
           if await ctx.sendWork(work): delWork.add msgId
 
-        elif work.typ == PubAck and work.qos == 1:
-          if await ctx.sendWork(work): delWork.add msgId
+        elif work.wk == PubWork and work.state == WorkNew:
+          if work.typ == Publish and work.qos == 0:
+            if await ctx.sendWork(work): delWork.add msgId
 
-        elif work.typ == PubComp and work.qos == 2:
-          if await ctx.sendWork(work): delWork.add msgId
+          elif work.typ == PubAck and work.qos == 1:
+            if await ctx.sendWork(work): delWork.add msgId
 
-        else:
-          if await ctx.sendWork(work): work.state = WorkSent
+          elif work.typ == PubComp and work.qos == 2:
+            if await ctx.sendWork(work): delWork.add msgId
 
-      elif work.wk == SubWork and work.state == WorkNew:
-        if work.typ == Subscribe:
-          if await ctx.sendWork(work): work.state = WorkSent
+          else:
+            if await ctx.sendWork(work): work.state = WorkSent
 
-        elif work.typ == Unsubscribe:
-          if await ctx.sendWork(work):
-            work.state = WorkSent
-            #ctx.pubCallbacks.del work.topic
+        elif work.wk == SubWork and work.state == WorkNew:
+          if work.typ == Subscribe:
+            if await ctx.sendWork(work): work.state = WorkSent
 
-    for msgId in delWork:
-      ctx.workQueue.del msgId
+          elif work.typ == Unsubscribe:
+            if await ctx.sendWork(work):
+              work.state = WorkSent
+              #ctx.pubCallbacks.del work.topic
+
+      for msgId in delWork:
+        ctx.workQueue.del msgId
+        
+    except:
+      echo "crash in work"
   ctx.inWork = false
 
 
@@ -597,11 +628,26 @@ proc onConnect(ctx: MqttCtx, pkt: Pkt) {.async.} =
   result = ctx.work()
 ]#
 
+proc publishToSubscribers(seqctx: seq[MqttCtx], pkt: Pkt, topic, message: string, qos: uint8) {.async.} =
+  ## Publish async to clients
+  for c in seqctx:
+    let msgId = c.nextMsgId()
+    #let qosSub = qosAlign(qos, c.subscribe[topic])
+    let qosSub = qosAlign(qos, qos)
+    c.workQueue[msgId] = Work(wk: PubWork, msgId: msgId, topic: topic, qos: qosSub, message: message, typ: Publish)
+    await c.work()
+
+when defined(dev):
+  var totalPublishReceived: int
+
 proc onPublish(ctx: MqttCtx, pkt: Pkt) {.async.} =
   var
     offset: int
     msgid: MsgId
     topic, message: string
+
+  when defined(dev):
+    totalPublishReceived += 1
 
   (topic, offset) = pkt.getstring(0, true)
 
@@ -611,14 +657,27 @@ proc onPublish(ctx: MqttCtx, pkt: Pkt) {.async.} =
     ctx.msgIdSeq = msgId
 
   (message, offset) = pkt.getstring(offset, false)
+  # Publish msg to all subscribers on global
+  if mqttsub.subscribers.hasKey("#"):
+    await publishToSubscribers(mqttsub.subscribers["#"], pkt, topic, message, qos)
+    #[
+    echo "IN 1"
+    for c in mqttsub.subscribers["#"]:
+      let msgId = c.nextMsgId()
+      let qosSub = qosAlign(qos, c.subscribe["#"])
+      c.workQueue[msgId] = Work(wk: PubWork, msgId: msgId, topic: topic, qos: qosSub, message: message, typ: Publish)
+      await c.work()]#
 
-  # Publish msg to all subscribers
+  # Publish to specific topic
   if mqttsub.subscribers.hasKey(topic):
+    await publishToSubscribers(mqttsub.subscribers[topic], pkt, topic, message, qos)
+    #[
+    echo "IN 2"
     for c in mqttsub.subscribers[topic]:
       let msgId = c.nextMsgId()
       let qosSub = qosAlign(qos, c.subscribe[topic])
       c.workQueue[msgId] = Work(wk: PubWork, msgId: msgId, topic: topic, qos: qosSub, message: message, typ: Publish)
-      await c.work()
+      await c.work()]#
 
   if qos == 1:
     ctx.workQueue[msgId] = Work(wk: PubWork, msgId: msgId, state: WorkNew, qos: 1, typ: PubAck)
@@ -699,12 +758,8 @@ proc onSubscribe(ctx: MqttCtx, pkt: Pkt) {.async.} =
     (topic, offset)   = pkt.getstring(offset, parseInt($nextLen))
     (qos, offset)     = pkt.getu8(offset)
 
-    echo topic
-
     ctx.subscribe[topic] = qos
-    echo "1"
-    addSubscriber(ctx, topic)
-    echo "2"
+    await addSubscriber(ctx, topic)
 
   mqttsub.dmp()
 
@@ -726,7 +781,7 @@ proc onUnsubscribe(ctx: MqttCtx, pkt: Pkt) {.async.} =
     (nextLen, offset) = pkt.getu16(offset)
     (topic, offset)   = pkt.getstring(offset, parseInt($nextLen))
 
-    removeSubscriber(ctx, topic)
+    await removeSubscriber(ctx, topic)
     ctx.subscribe.del(topic)
 
   mqttsub.dmp()
@@ -736,7 +791,7 @@ proc onUnsubscribe(ctx: MqttCtx, pkt: Pkt) {.async.} =
 
 
 proc onDisconnect(ctx: MqttCtx, pkt: Pkt) {.async.} =
-  removeSubscriber(ctx)
+  await removeSubscriber(ctx)
   await sendWill(ctx)
   ctx.state = Disconnected
   when defined(verbose):
@@ -857,20 +912,31 @@ proc processClient(s: AsyncSocket) {.async.} =
   let ctx = newMqttCtx("new")
   ctx.s = s
   ctx.state = Connecting
-  while ctx.state in [Connecting, Connected]:
-    var pkt = await ctx.recv()
-    if pkt.typ == Notype:
-      break
-    await ctx.handle(pkt)
-    #asyncCheck ctx.handle(pkt)
+  while ctx.state in {Connecting, Connected}:
+    try:
+      var pkt = await ctx.recv()
+      if pkt.typ == Notype:
+        break
+      await ctx.handle(pkt)
+      #asyncCheck ctx.handle(pkt)
+    except:
+      echo "Boom"
+      ctx.state = Error
 
   if ctx.state != Disconnected:
-    removeSubscriber(ctx)
-    await sendWill(ctx)
-    when defined(verbose):
-      echo ctx.clientid & " was lost"
+    try:
+      await removeSubscriber(ctx)
+      await sendWill(ctx)
+      when defined(verbose):
+        echo ctx.clientid & " was lost"
+    except:
+      echo ctx.clientid & " crashed"
 
   ctx.state = Disabled
+
+  #while ctx.workQueue.len > 0:
+  #  await sleepAsync 1000
+  #ctx.s.close()
 
 proc serve(ctx: MqttBroker) {.async.} =
   var server = newAsyncSocket()
@@ -879,6 +945,9 @@ proc serve(ctx: MqttBroker) {.async.} =
   server.listen()
   ctx.state = Connected
 
+  #
+  #brokerSub
+  #asyncCheck actSub()
   while true:
     let client = await server.accept()
     asyncCheck processClient(client)
@@ -973,6 +1042,14 @@ proc msgQueue*(ctx: MqttCtx): int =
   ## exiting your program.
   result = ctx.workQueue.len()
 ]#
+proc handler() {.noconv.} =
+  ## Catch ctrl+c from user
+  when defined(dev):
+    echo "TOTAL PUBLISH RECV: " & $totalPublishReceived
+  echo "LEN OF MQTTSUB:     " & $mqttsub.subscribers.len
+  quit()
+
+setControlCHook(handler)
 
 when isMainModule:
   let ctx = newMqttBroker("master")

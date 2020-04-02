@@ -30,6 +30,7 @@ Thousands of parallel connections - subscribe and publish - causes a problem....
 There's a lot of things, but these are first priority.
 
 * Disconnect client after 1,5 time the `keepAlive` time
+* Retain
 * Wildcards in topics: `+`
 * Clean Session
 
